@@ -92,6 +92,8 @@ class InternLM2Config(PretrainedConfig):
         eos_token_id=2,
         tie_word_embeddings=False,
         bias=True,
+        n_new_heads = 8,
+        loss_type = "kl",
         rope_theta=10000,
         rope_scaling=None,
         attn_implementation='eager',
@@ -104,6 +106,8 @@ class InternLM2Config(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         self.bias = bias
+        self.n_new_heads = n_new_heads
+        self.loss_type = loss_type
 
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads

@@ -828,7 +828,7 @@ class InternLM2Model(InternLM2PreTrainedModel):
             print('Warning: Flash attention is not available, using eager attention instead.')
 
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.n_new_heads = config.n_heads
+        self.n_new_heads = config.n_new_heads
         self.layers = nn.ModuleList([InternLM2DecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.extra_heads = torch.nn.ModuleList()
         for i in range(n_new_heads):
