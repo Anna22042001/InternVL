@@ -19,6 +19,7 @@ import queue
 import threading
 import warnings
 from typing import List, Optional, Tuple, Union
+import copy
 
 import torch
 import torch.nn.functional as F
@@ -827,8 +828,12 @@ class InternLM2Model(InternLM2PreTrainedModel):
             print('Warning: Flash attention is not available, using eager attention instead.')
 
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-
+        self.n_new_heads = config.n_heads
         self.layers = nn.ModuleList([InternLM2DecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.extra_heads = torch.nn.ModuleList()
+        for i in range(n_new_heads):
+            self.extra_heads.append(copy.deepcopy(self.layers[-1]))
+
         self.norm = InternLM2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = False
@@ -941,7 +946,7 @@ class InternLM2Model(InternLM2PreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
 
-        for idx, decoder_layer in enumerate(self.layers):
+        for idx, decoder_layer in enumerate(self.layers[:-1]):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -980,8 +985,14 @@ class InternLM2Model(InternLM2PreTrainedModel):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
-
-        hidden_states = self.norm(hidden_states)
+        # Prediction heads.
+        
+        prediction_heads = [self.layers[-1]] + list(self.extra_heads)
+        latents = []
+        for layer in prediction_heads:
+            latents.append(hidden_states)
+        hidden_states = torch.stack(latents, dim=-2) 
+        hidden_states = self.norm(hidden_states) # B, T, num_pred_heads, C
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
@@ -1008,6 +1019,8 @@ class InternLM2ForCausalLM(InternLM2PreTrainedModel):
         super().__init__(config)
         self.model = InternLM2Model(config)
         self.vocab_size = config.vocab_size
+        self.n_new_heads = config.n_new_heads
+        self.loss_type = config.loss_type
         self.output = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
@@ -1093,21 +1106,38 @@ class InternLM2ForCausalLM(InternLM2PreTrainedModel):
 
         hidden_states = outputs[0]
         # HERE
+        
         logits = self.output(hidden_states)
         logits = logits.float()
 
-        loss = None
-        if labels is not None:
-            # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+        loss = 0.0
+        for i in range(self.n_new_heads):
+            shift_logits = logits[..., :-(1+i), i+1, :].contiguous()
+            shift_labels = logits[..., (1+i):, 0, :].contiguous()
+            if self.loss_type == "kl":
+                loss_i = F.kl_div(
+                    F.log_softmax(shift_logits, dim=-1),
+                    F.log_softmax(shift_labels, dim=-1),
+                    reduction="sum",
+                ) / self.n_new_heads
+            elif self.loss_type == "mse":
+                loss_i = F.mse_loss(
+                    F.log_softmax(shift_logits, dim=-1).view(-1),
+                    F.log_softmax(shift_labels, dim=-1).view(-1),
+                    reduction="mean",
+                ) / self.n_new_heads
+            loss += loss_i
+        # if labels is not None:
+        #     # Shift so that tokens < n predict n
+        #     shift_logits = logits[..., :-1, :].contiguous()
+        #     shift_labels = labels[..., 1:].contiguous()
+        #     # Flatten the tokens
+        #     loss_fct = CrossEntropyLoss()
+        #     shift_logits = shift_logits.view(-1, self.config.vocab_size)
+        #     shift_labels = shift_labels.view(-1)
+        #     # Enable model parallelism
+        #     shift_labels = shift_labels.to(shift_logits.device)
+        #     loss = loss_fct(shift_logits, shift_labels)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
